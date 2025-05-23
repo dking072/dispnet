@@ -7,32 +7,47 @@ import h5py
 import lightning as L
 
 #loader to import dicts:
-import cace
-from cace.data.atomic_data import AtomicData
-from cace.tools.torch_geometric import Dataset, DataLoader
+from mace.data import AtomicData
+from mace.tools.torch_geometric import Dataset, DataLoader
+# from cace.tools.torch_geometric import Dataset, DataLoader
 
-def from_xyz(a,cutoff,data_key):
-    a.info = {k:v for k,v in a.info.items() if type(v) != str}
-    ad = AtomicData.from_atoms(a,cutoff=cutoff,data_key=data_key)
-    if "c6" in ad.keys:
-        ad["c6"] = ad["c6"].ravel()
-        ad["c6_ptr"] = ad["c6"].shape[0]
+def from_config(a,c,cutoff,z_table):
+    ks=["energy","force","forces","c6","numbers","positions"]
+    # a.info = {k:v for k,v in a.info.items() if type(v) != str}
+    ad = AtomicData.from_config(c,cutoff=cutoff,z_table=z_table)
+    for k,v in a.info.items():
+        if k not in ks:
+            continue
+        ad[k] = torch.tensor(v,dtype=ad["positions"].dtype)
+    for k,v in a.arrays.items():
+        if k not in ks:
+            continue
+        if k == "c6":
+            ad["c6"] = torch.tensor(v,dtype=ad["positions"].dtype).ravel()
+            ad["c6_ptr"] = ad["c6"].shape[0]
+        else:
+            ad[k] = torch.tensor(v,dtype=ad["positions"].dtype)
     return ad
 
-class XYZDataset(Dataset):
-    def __init__(self,root_xyz,cutoff=4.0, drop_last=True,
+class MaceXYZDataset(Dataset):
+    def __init__(self,root_xyz,cutoff=4.0,zs=[1,6,7,8,9,15,16,17,35,53],ks=["c6"],
                 transform=None, pre_transform=None, pre_filter=None):
         super().__init__(root_xyz, transform, pre_transform, pre_filter)
         self.root = root_xyz
         self.cutoff = cutoff
+        self.zs = zs
+        self.ks = ks
         self.prepare_data()
     
     def prepare_data(self):
-        dataset = cace.tasks.get_dataset_from_xyz(self.root,valid_fraction=1e-10,cutoff=self.cutoff)
-        data_key = [k for k,v in dataset.train[0].arrays.items() if (k not in ["numbers"])]
-        data_key += [k for k,v in dataset.train[0].info.items() if (type(v) != str)]
-        data_key = {k : k for k in data_key}
-        dataset = [from_xyz(a,self.cutoff,data_key) for a in dataset.train]
+        from mace.data import config_from_atoms_list
+        from mace.tools.utils import AtomicNumberTable
+        from ase import io
+        import torch
+        atms = ase.io.read(self.root,index=":")
+        configs = config_from_atoms_list(atms)
+        z_table = AtomicNumberTable(self.zs)
+        dataset = [from_config(a,c,self.cutoff,z_table) for a,c in zip(atms,configs)]
         self.dataset = dataset
 
     def len(self):
@@ -41,7 +56,7 @@ class XYZDataset(Dataset):
     def get(self, idx):
         return self.dataset[idx]
 
-class XYZData(L.LightningDataModule):
+class MaceXYZData(L.LightningDataModule):
     def __init__(self, root_xyz, cutoff=4.0, batch_size=32, drop_last=True, shuffle=True, valid_p=0.05, test_p=0.05):
         super().__init__()
         self.batch_size = batch_size
@@ -51,14 +66,15 @@ class XYZData(L.LightningDataModule):
         self.cutoff = cutoff
         self.drop_last = drop_last
         self.shuffle = shuffle
-        try:
-            self.num_cpus = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
-        except:
-            self.num_cpus = os.cpu_count()
+        self.num_cpus = 1
+        # try:
+        #     self.num_cpus = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
+        # except:
+        #     self.num_cpus = os.cpu_count()
         self.prepare_data()
     
     def prepare_data(self):
-        dataset = XYZDataset(self.root)
+        dataset = MaceXYZDataset(self.root)
         torch.manual_seed(12345)
         if self.shuffle:
             dataset = dataset.shuffle()
