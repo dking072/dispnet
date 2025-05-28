@@ -12,7 +12,8 @@ from cace.data.atomic_data import AtomicData
 from cace.tools.torch_geometric import Dataset, DataLoader
 
 def from_xyz(a,cutoff,data_key):
-    a.info = {k:v for k,v in a.info.items() if type(v) != str}
+    # a.info = {k:v for k,v in a.info.items() if k in ks}
+    # a.arrays = {k:v for k,v in a.arrays.items() if k in ks}
     ad = AtomicData.from_atoms(a,cutoff=cutoff,data_key=data_key)
     if "c6" in ad.keys:
         ad["c6"] = ad["c6"].ravel()
@@ -31,7 +32,8 @@ class XYZDataset(Dataset):
         dataset = cace.tasks.get_dataset_from_xyz(self.root,valid_fraction=1e-10,cutoff=self.cutoff)
         data_key = [k for k,v in dataset.train[0].arrays.items() if (k not in ["numbers"])]
         data_key += [k for k,v in dataset.train[0].info.items() if (type(v) != str)]
-        data_key = {k : k for k in data_key}
+        ks = ["energy","force","forces","c6","numbers","positions"]
+        data_key = {k : k for k in ks}
         dataset = [from_xyz(a,self.cutoff,data_key) for a in dataset.train]
         self.dataset = dataset
 
