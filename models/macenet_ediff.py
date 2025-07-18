@@ -1,4 +1,3 @@
-
 import cace
 import lightning as L
 import torch
@@ -9,8 +8,38 @@ from e3nn import o3
 import torch.nn.functional as F
 from mace.modules.blocks import LinearReadoutBlock, NonLinearReadoutBlock
 
+def make_batch(numA):
+    arr = []
+    for i,n in enumerate(numA):
+        arr.append(torch.ones(n)*i)
+    return torch.hstack(arr).to(numA.device).long()
+
+def make_ptr(numA):
+    arr1 = torch.zeros(1).to(numA.device)
+    arr2 = torch.cumsum(numA,dim=0)
+    return torch.hstack([arr1,arr2]).long()
+
+def make_edge_ptr(numA_edges):
+    arr1 = torch.zeros(1).to(numA_edges.device)
+    arr2 = torch.cumsum(numA_edges,dim=0)
+    return torch.hstack([arr1,arr2]).long()
+
+def prep_batch(batch,og_ptr,typ="A"):
+    ks = ["positions","node_attrs","edge_index","shifts","unit_shifts"]
+    for k in ks:
+        batch[k] = batch[f"{k}_mon{typ}"]
+    batch["ptr"] = make_ptr(batch[f"num{typ}"])
+    batch["batch"] = make_batch(batch[f"num{typ}"])
+    batch["edge_ptr"] = make_edge_ptr(batch[f"num{typ}_edges"])
+    #Correct the edge collation
+    for i, p in enumerate(og_ptr[:-1]):
+        edge_start, edge_stop = batch["edge_ptr"][i], batch["edge_ptr"][i+1]
+        batch["edge_index"][:,edge_start:edge_stop] -= p
+        batch["edge_index"][:,edge_start:edge_stop] += batch["ptr"][i]
+    return batch
+
 class DispNet(L.LightningModule):
-    def __init__(self,representation,nc=16,freeze=True,anisotropy=False):
+    def __init__(self,representation,nc=16,freeze=True,freeze_damping=True,anisotropy=False):
         super().__init__()
         cutoff = representation.r_max.item()
         zs = representation.atomic_numbers
@@ -27,9 +56,16 @@ class DispNet(L.LightningModule):
         self.register_buffer('min_e',torch.tensor(0.001))
 
         #For fit:
-        self.register_buffer('a1',torch.tensor(0.49484001))
-        self.register_buffer('s8',torch.tensor(0.78981345))
-        self.register_buffer('a2',torch.tensor(5.73083694))
+        self.a1 = torch.nn.Parameter(torch.tensor(0.49484001))
+        self.s8 = torch.nn.Parameter(torch.tensor(0.78981345))
+        self.a2 = torch.nn.Parameter(torch.tensor(5.73083694))
+        if freeze_damping:
+            self.a1.requires_grad_(False)
+            self.s8.requires_grad_(False)
+            self.a2.requires_grad_(False)
+        # self.register_buffer('a1',torch.tensor(0.49484001))
+        # self.register_buffer('s8',torch.tensor(0.78981345))
+        # self.register_buffer('a2',torch.tensor(5.73083694))
 
         irreps_in = o3.Irreps("192x0e + 192x1o + 192x0e")
         irreps_out = o3.Irreps(f"{nc}x0e")
@@ -68,10 +104,27 @@ class DispNet(L.LightningModule):
         e_tot = e_tot * hartree_to_ev #convert to eV
         return e_tot
 
-    def forward(self,data,training=False,calc_force=True):
-        data["positions"].requires_grad = True
+    def calc_d3(self,data):
         data["atomic_numbers"] = (self.representation.atomic_numbers[None,:] * data["node_attrs"]).sum(axis=1).int()
-        #["node_feats"] is 1 + 3 + 1
+        ref = d3.reference.Reference().to(data["positions"].device)
+        results = []
+        for i in torch.unique(data["batch"]):
+            idx = torch.where(data["batch"] == i)[0]
+            numbers = data["atomic_numbers"][idx]
+            positions = data["positions"][idx] * self.ang_to_bohr
+            rcov = self.COV_D3[numbers]
+            cn = mctc.ncoord.cn_d3(
+                numbers, positions, counting_function=mctc.ncoord.exp_count, rcov=rcov
+            )
+            weights = d3.model.weight_references(numbers, cn, ref, d3.model.gaussian_weight)
+            c6 = d3.model.atomic_c6(numbers, weights, ref)        
+            e_tot = self.compute_disp(numbers,positions,c6)
+            results.append(e_tot)
+        d3_energy = torch.stack(results)
+        return d3_energy
+
+    def calc_disp(self,data):
+        data["atomic_numbers"] = (self.representation.atomic_numbers[None,:] * data["node_attrs"]).sum(axis=1).int()
         data["node_feats"] = self.representation(data,compute_force=False)["node_feats"]
 
         #Predict alpha with energies/mu, in a.u.
@@ -96,17 +149,26 @@ class DispNet(L.LightningModule):
         dyad = (data["dyad_tr"][:,:,None,None] * diag_mask[None,None,:,:])/3 + sym_notrace
 
         #Calculate alpha (scalar and matrix) from dyad
-        data["alpha"], data["alpha_avg"] = self.calc_alpha(data["e"],dyad) #(N,G,3,3) / (N,G)        
+        data["alpha"], data["alpha_avg"] = self.calc_alpha(data["e"],dyad) #(N,G,3,3) / (N,G)
 
-        #Calculate dipole/dipole interaction tensor
+        #Calculate safe pairwise distances
         r_ij = data["positions"][None,:,:] - data["positions"][:,None,:] # (N,N,3)
         torch.diagonal(r_ij).add_(0.1) # for safe derivatives
+        r_ij_2 = torch.ones_like(r_ij) * 0.1 #Fixed distance between batches
+        for i in range(data["ptr"][:-1].shape[0]):
+            start, stop = data["ptr"][i], data["ptr"][i+1]
+            r_ij_2[start:stop,start:stop,:] = r_ij[start:stop,start:stop,:]
+        r_ij = r_ij_2
         norm = torch.norm(r_ij,dim=-1) # (N,N)
         rhat_ij = r_ij / norm[:,:,None] #normalize
-        t = 3 * rhat_ij[:,:,None,:] * rhat_ij[:,:,:,None] - diag_mask[None,None,:,:]
+        
+        #Calculate dipole/dipole interaction tensor
+        t = 3 * rhat_ij[:,:,None,:] * rhat_ij[:,:,:,None] - diag_mask[None,None,:,:] # (N,N,3,3)
         torch.diagonal(t).zero_() #Zero self-interaction
-
+        
         #Interaction and integrate over frequencies for C6
+        if t.isnan().any():
+            print("NaN found!")
         atat = torch.einsum("agij,abjk,bgkl,abli->abg",data["alpha"],t,data["alpha"],t) #(N,N,G)
         c6all = (1/(2*torch.pi)) * torch.trapz(atat, self.zeta, dim=-1)
 
@@ -123,21 +185,34 @@ class DispNet(L.LightningModule):
             mask = ~torch.eye(c6.shape[0], dtype=torch.bool, device=c6.device)
             c6_results.append(c6[mask].ravel()) #remove diagonal
         d3_energy = torch.stack(results)
-        data["pred_energy"] = d3_energy
-        data["pred_c6"] = torch.hstack(c6_results)
+        return d3_energy        
 
-        if calc_force:
-            grad_outputs = [torch.ones_like(data["pred_energy"])]
-            gradients = torch.autograd.grad(
-                outputs=[data["pred_energy"]],  # [n_graphs, ]
-                inputs=[data["positions"]],  # [n_nodes, 3]
-                grad_outputs=grad_outputs,
-                retain_graph=training,  # Make sure the graph is not destroyed during training
-                create_graph=training,  # Create graph for second derivative
-                allow_unused=False,  # For complete dissociation turn to true
-            )[0]
-            data["pred_force"] = -gradients
-            if data["pred_force"].isnan().any():
-                print("NaN Force Predicted!")
+    def forward(self,data,calc_d3=False,training=False):
+        og_ptr = data["ptr"]
         
+        #Calc for dimer:
+        dimer_disp = self.calc_disp(data)
+        if calc_d3:
+            dimer_d3 = self.calc_d3(data)
+        
+        #Calc for monA:
+        data = prep_batch(data,og_ptr,typ="A")
+        monA_disp = self.calc_disp(data)
+        if calc_d3:
+            monA_d3 = self.calc_d3(data)
+        
+        #Calc for monB:
+        data = prep_batch(data,og_ptr,typ="B")
+        monB_disp = self.calc_disp(data)
+        if calc_d3:
+            monB_d3 = self.calc_d3(data)
+        
+        #Calc ediff:
+        ediff = dimer_disp - (monA_disp + monB_disp)
+        data["pred_energy"] = ediff
+        if calc_d3:
+            ediff_d3 = dimer_d3 - (monA_d3 + monB_d3)
+            data["pred_d3"] = ediff_d3
+
         return data
+        
