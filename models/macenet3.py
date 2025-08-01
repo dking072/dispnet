@@ -68,7 +68,7 @@ class DispNet(L.LightningModule):
         e_tot = e_tot * hartree_to_ev #convert to eV
         return e_tot
 
-    def forward(self,data,training=False,calc_force=True):
+    def forward(self,data,training=False,calc_force=True,calc_adiv=False):
         data["positions"].requires_grad = True
         data["atomic_numbers"] = (self.representation.atomic_numbers[None,:] * data["node_attrs"]).sum(axis=1).int()
         #["node_feats"] is 1 + 3 + 1
@@ -139,5 +139,25 @@ class DispNet(L.LightningModule):
             data["pred_force"] = -gradients
             if data["pred_force"].isnan().any():
                 print("NaN Force Predicted!")
+
+        if calc_adiv: #isotropic j
+            unique_batches = torch.unique(data["batch"])  # Get unique batch indices
+            all_j = []
+            assert(len(unique_batches) == 1) #Not tested for more
+            for i in unique_batches:
+                idx = torch.where(data["batch"] == i)[0]
+                alpha_iso = data["alpha_avg"][idx,0].sum()
+                grad_outputs = [torch.ones_like(alpha_iso)]
+                gradients = torch.autograd.grad(
+                    outputs=[alpha_iso],  # [n_graphs, ]
+                    inputs=[data["positions"]],  # [n_nodes, 3]
+                    grad_outputs=grad_outputs,
+                    retain_graph=training,  # Make sure the graph is not destroyed during training
+                    create_graph=training,  # Create graph for second derivative
+                    allow_unused=False,  # For complete dissociation turn to true
+                )[0]
+                all_j.append(gradients[idx])
+            all_j = torch.vstack(all_j)
+            data["alpha_avg_div"] = all_j
         
         return data

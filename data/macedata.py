@@ -29,6 +29,20 @@ def from_config(a,c,cutoff,z_table,info_ks,array_ks):
             ad[k] = torch.tensor(a.arrays[k],dtype=dtype)
     return ad
 
+def from_atm(atm,cutoff=4.5,zs=[1,6,7,8,9,15,16,17,35,53]):
+    from mace.data import config_from_atoms_list
+    from mace.tools.utils import AtomicNumberTable
+    from ase import io
+    import torch
+    info_ks = atm.info.keys()
+    array_ks = atm.arrays.keys()
+    atms = [atm]
+    configs = config_from_atoms_list(atms)
+    z_table = AtomicNumberTable(zs)
+    dataset = [from_config(a,c,cutoff,z_table,info_ks,array_ks) for a,c in zip(atms,configs)]
+    dataloader = DataLoader(dataset, batch_size=1, drop_last=False, shuffle=False, num_workers=1)
+    return next(iter(dataloader))
+
 class MaceXYZDataset(Dataset):
     def __init__(self,root_xyz,cutoff=4.5,zs=[1,6,7,8,9,15,16,17,35,53],limit_ks=False,
                 transform=None, pre_transform=None, pre_filter=None):
