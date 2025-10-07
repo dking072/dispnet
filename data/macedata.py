@@ -19,12 +19,18 @@ def from_config(a,c,cutoff,z_table,info_ks,array_ks):
             continue
         ad[k] = torch.tensor(a.info[k],dtype=dtype)
     for k in array_ks:
-        if k == "c6":
+        if k == "c6": #Need to add c6div logic as well
             #Remove non-diagonal c6
-            c6 = torch.tensor(a.arrays[k],dtype=ad["positions"].dtype)
+            c6 = torch.tensor(a.arrays[k],dtype=dtype)
             mask = ~torch.eye(c6.shape[0], dtype=torch.bool, device=c6.device)
             ad["c6"] = c6[mask].ravel()
             # ad["c6_ptr"] = ad["c6"].shape[0] Just n(n-1)
+        elif k == "c6div":
+            n = ad["positions"].shape[0]
+            c6div = torch.tensor(a.arrays[k],dtype=dtype)
+            c6div = c6div.reshape(n,n,n,3)
+            mask = ~torch.eye(c6div.shape[0], dtype=torch.bool, device=c6div.device)
+            ad["c6div"] = c6div[mask].ravel()
         else:
             ad[k] = torch.tensor(a.arrays[k],dtype=dtype)
     return ad
