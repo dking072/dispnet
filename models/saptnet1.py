@@ -60,6 +60,12 @@ class SaptNet(L.LightningModule):
         q = self.qnet(out["node_feats"])
         e_lr = self.ewald.forward(q,data["positions"],None,data["batch"])
         return e_lr
+
+    def pred_q(self,data):
+        out = self.representation.forward(data,compute_force=False)
+        data["les_q"] = out["latent_charges"]
+        data["pred_q"] = self.qnet(out["node_feats"])
+        return data
     
     def forward(self,data,training=False):
         og_ptr = data["ptr"]

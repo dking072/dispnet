@@ -19,7 +19,7 @@ from mace.tools.compile import simplify_if_compile
 from mace.tools.scatter import scatter_sum
 # from mace.tools.utils import LAMMPS_MP
 
-@compile_mode("script")
+# @compile_mode("script")
 class NonLinearDipolePolarReadoutBlock(torch.nn.Module):
     def __init__(
         self,
@@ -34,7 +34,8 @@ class NonLinearDipolePolarReadoutBlock(torch.nn.Module):
         if use_polarizability:
             # print("You will calculate the polarizability and dipole.")
             # self.irreps_out = o3.Irreps("2x0e + 1x1o + 1x2e")
-            self.irreps_out = o3.Irreps("1x0e + 1x2e")
+            self.irreps_out = o3.Irreps("1x0e + 1x1e + 1x2e")
+            # self.irreps_out = o3.Irreps("1x0e + 1x2e")
         else:
             raise ValueError(
                 "Invalid configuration for NonLinearDipolePolarReadoutBlock: "

@@ -61,78 +61,72 @@ class SaptNet(L.LightningModule):
         gate = e3nn.nn.Activation(mlp_irreps,[F.silu])
         self.qnet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
 
-        #Make 2e elements
-        irreps_in = o3.Irreps('192x0e + 192x1o + 192x0e')
-        irreps_out = o3.Irreps('192x0e + 192x2e')
-        irreps_out, instructions = tp_out_irreps_with_instructions(irreps_in,irreps_in,irreps_out)
-        self.tp = o3.TensorProduct(irreps_in,irreps_in,irreps_out,instructions)
+        #Summed outer products for polarizabilities
+        irreps_out = o3.Irreps(f"192x0e")
+        self.enet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
+        self.linmix = torch.nn.Linear(192,192, bias=False)
 
-        #Nonlinear readout for polarizabilities
-        mlp_irreps = o3.Irreps('192x0e + 192x2e')
-        gate = e3nn.nn.Activation(o3.Irreps("192x0e"),[F.silu])
-        self.dnet = NonLinearDipolePolarReadoutBlock(irreps_out,mlp_irreps,gate)
-        self.ct = CartesianTensor("ij=ji")
-
-    def calc_lr(self,data,out):
+    def calc_lr(self,data,out,label="default"):
+        #Calc both ES and pol
         q = self.qnet(out["node_feats"])
-        e_lr = self.ewald.forward(q,data["positions"],None,data["batch"])
-        return e_lr
+        e_es = self.ewald.forward(q,data["positions"],None,data["batch"])
 
-    def calc_pol(self,data,out):
-        #Uses latent charges from MACE
-        tp = self.tp(out["node_feats"],out["node_feats"])
-        dnet = self.dnet(tp) # 1x0e + 1x2e
+        #Linearly mix
+        evals = F.relu(self.enet(out["node_feats"]))
+        n = out["node_feats"].shape[0]
+        evecs = out["node_feats"][:,192:-192].reshape(n,192,3)
+        evecs = self.linmix(evecs.transpose(-1,-2)).transpose(-1,-2)
+
+        #Take outer products for polarizabilities
+        alpha = evecs[:,:,:,None] * evecs[:,:,None,:]
+        alpha = evals[:,:,None,None] * alpha
+        I3 = torch.eye(3, device=q.device, dtype=q.dtype)
+        atomic_pol = alpha.sum(axis=1) + I3[None,:,:] * 1e-4
+        # data[f"atomic_pol_{label}"] = atomic_pol
         
-        #Calculate charges and polarizabilities
-        # atomic_pol = self.ct.to_cartesian(dnet)
-        s_matrix = self.ct.to_cartesian(dnet) #gosh ai is getting smart lol
-        data["atomic_pol"] = torch.matrix_exp(s_matrix)
-
         epols = [] #Try training on both? Huh...
         unique_batches = torch.unique(data["batch"])
         for i in unique_batches:
             mask = data["batch"] == i  # Create a mask for the i-th configuration
-            r_now, q_now = data["positions"][mask], out["latent_charges"][mask]
-            alpha_now = data["atomic_pol"][mask]
-            if (data["cell"] is not None) and (len(data["cell"].shape) == 3):
-                box_now = data["cell"][i]  # Get the box for the i-th configuration
-                if torch.linalg.det(box_now) < 1e-6:
-                    box_now = None
-            else:
-                box_now = None
+            r_now, q_now = data["positions"][mask], q[mask]
+            alpha_now = atomic_pol[mask]
 
-            # check if the box is periodic or not
-            if box_now is None:
-                E = calc_efield(r_now,q_now)
-                A = build_polarization_matrix(r_now,alpha_now)
-                mu = torch.linalg.solve(A, E.ravel())
-                epol = -0.5 * torch.dot(E.ravel(),mu)
-                epols.append(epol)
-            else:
-                pass
-        return torch.stack(epols)
-    
+            E = calc_efield(r_now,q_now)
+            A = build_polarization_matrix(r_now,alpha_now)
+            mu = torch.linalg.solve(A, E.ravel())
+            epol = -0.5 * torch.dot(E.ravel(),mu)
+            epols.append(epol)
+        e_ind = torch.stack(epols)
+
+        return e_es, e_ind
+            
     def forward(self,data,training=False):
         og_ptr = data["ptr"]
         
         #Calc for dimer:
-        lr_energies = {}
+        lr_energies = {"es":[],"ind":[]}
         dimer_out = self.representation.forward(data,compute_force=False)
-        # lr_energies["dimer"] = self.calc_lr(data,dimer_out)
-        lr_energies["dimer"] = self.calc_pol(data,dimer_out)
+        e_es, e_ind = self.calc_lr(data,dimer_out,label="dimer")
+        lr_energies["es"].append(e_es)
+        lr_energies["ind"].append(e_ind)
         
         #Calc for monA:
         data = prep_batch(data,og_ptr,typ="A")
         monA_out = self.representation.forward(data,compute_force=False)
-        lr_energies["monA"] = self.calc_pol(data,monA_out)
+        e_es, e_ind = self.calc_lr(data,monA_out,label="monA")
+        lr_energies["es"].append(e_es)
+        lr_energies["ind"].append(e_ind)
         
         #Calc for monB:
         data = prep_batch(data,og_ptr,typ="B")
         monB_out = self.representation.forward(data,compute_force=False)
-        lr_energies["monB"] = self.calc_pol(data,monB_out)
+        e_es, e_ind = self.calc_lr(data,monB_out,label="monB")
+        lr_energies["es"].append(e_es)
+        lr_energies["ind"].append(e_ind)
 
         #Calc ediff:
-        data["pred_ind"] = lr_energies["dimer"] - (lr_energies["monA"] + lr_energies["monB"])
+        for k in ["es","ind"]:
+            data[f"pred_{k}"] = lr_energies[k][0] - (lr_energies[k][1] + lr_energies[k][2])
         for k in ["energy","les_energy"]:
             data[k] = dimer_out[k] - (monA_out[k] + monB_out[k])
 
