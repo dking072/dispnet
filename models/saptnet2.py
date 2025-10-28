@@ -45,7 +45,7 @@ def prep_batch(batch,og_ptr,typ="A"):
     return batch
 
 class SaptNet(L.LightningModule):
-    def __init__(self,representation,ewald_sigma=1.0,freeze=True):
+    def __init__(self,representation,qnet=None,ewald_sigma=1.0,freeze=True):
         super().__init__()
         cutoff = representation.r_max.item()
         zs = representation.atomic_numbers
@@ -59,7 +59,11 @@ class SaptNet(L.LightningModule):
         mlp_irreps = o3.Irreps(f"192x0e")
         irreps_out = o3.Irreps(f"1x0e")
         gate = e3nn.nn.Activation(mlp_irreps,[F.silu])
-        self.qnet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
+        if not qnet:
+            self.qnet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
+        else:
+            self.qnet = qnet
+            self.qnet.requires_grad_(False)
 
         #Summed outer products for polarizabilities
         irreps_out = o3.Irreps(f"192x0e")

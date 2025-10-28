@@ -19,6 +19,11 @@ from mace.tools.compile import simplify_if_compile
 from mace.tools.scatter import scatter_sum
 # from mace.tools.utils import LAMMPS_MP
 
+# print("You will calculate the polarizability and dipole.")
+# self.irreps_out = o3.Irreps("2x0e + 1x1o + 1x2e")
+# self.irreps_out = o3.Irreps("1x0e + 1x1e + 1x2e")
+# self.irreps_out = o3.Irreps("1x0e + 1x2e")
+
 # @compile_mode("script")
 class NonLinearDipolePolarReadoutBlock(torch.nn.Module):
     def __init__(
@@ -26,22 +31,13 @@ class NonLinearDipolePolarReadoutBlock(torch.nn.Module):
         irreps_in: o3.Irreps,
         MLP_irreps: o3.Irreps,
         gate: Callable,
+        irreps_out = o3.Irreps("1x0e + 1x2e"),
         use_polarizability: bool = True,
         cueq_config: Optional[CuEquivarianceConfig] = None,
     ):
         super().__init__()
         self.hidden_irreps = MLP_irreps
-        if use_polarizability:
-            # print("You will calculate the polarizability and dipole.")
-            # self.irreps_out = o3.Irreps("2x0e + 1x1o + 1x2e")
-            self.irreps_out = o3.Irreps("1x0e + 1x1e + 1x2e")
-            # self.irreps_out = o3.Irreps("1x0e + 1x2e")
-        else:
-            raise ValueError(
-                "Invalid configuration for NonLinearDipolePolarReadoutBlock: "
-                "use_polarizability must be either True."
-                "If you want to calculate only the dipole, use AtomicDipolesMACE."
-            )
+        self.irreps_out = irreps_out
         irreps_scalars = o3.Irreps(
             [(mul, ir) for mul, ir in MLP_irreps if ir.l == 0 and ir in self.irreps_out]
         )
