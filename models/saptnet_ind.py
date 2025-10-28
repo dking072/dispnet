@@ -72,12 +72,12 @@ class SaptNet(L.LightningModule):
             irreps_in = o3.Irreps('192x0e + 192x1o + 192x0e')
             irreps_out = o3.Irreps('192x0e + 192x2e')
             tp_irreps_out, instructions = tp_out_irreps_with_instructions(irreps_in,irreps_in,irreps_out)
-            self.tp = o3.TensorProduct(irreps_in,irreps_in,tp_irreps_out,instructions).cuda()
+            self.tp = o3.TensorProduct(irreps_in,irreps_in,tp_irreps_out,instructions)
             
             mlp_irreps = o3.Irreps('192x0e + 192x2e')
             dnet_irreps_out = o3.Irreps("1x0e + 1x2e")
             gate = e3nn.nn.Activation(o3.Irreps("192x0e"),[F.silu])
-            self.dnet = NonLinearDipolePolarReadoutBlock(tp_irreps_out,mlp_irreps,gate,irreps_out=dnet_irreps_out).cuda()
+            self.dnet = NonLinearDipolePolarReadoutBlock(tp_irreps_out,mlp_irreps,gate,irreps_out=dnet_irreps_out)
             self.ct = CartesianTensor("ij=ji")
         else:
             mlp_irreps = o3.Irreps(f"192x0e")
@@ -88,13 +88,12 @@ class SaptNet(L.LightningModule):
         e_es, e_pol = calc_elec(r,q,a)
         return {"e_es":e_es,"e_pol":e_pol}
 
-    def get_qa(self,node_feats):
+    def get_qa(self,node_feats,sqrt3 = 1.7320508):
         q = self.qnet(node_feats).squeeze()
         if self.anisotropy:
             #bias trace
             tp_out = self.tp(node_feats,node_feats)
             dnet_out = self.dnet(tp_out)
-            sqrt3 = torch.sqrt(torch.tensor(3))
             dnet_out[:,0] = F.relu(dnet_out[:,0] + self.a_bias)*sqrt3
             a = self.ct.to_cartesian(dnet_out)
         else:
