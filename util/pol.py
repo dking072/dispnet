@@ -75,8 +75,9 @@ def calc_elec(r_raw,q,alpha,sigma=1,calc_pot=True):
     
     #Calc E^T a E
     if len(alpha.shape) > 1:
-        print("Alpha shape:",alpha.shape)
-        assert(len(alpha.shape) == 3)
+        assert(len(alpha.shape) == 3) #[N,3,3]
+        assert(alpha.shape[-1] == 3)
+        assert(alpha.shape[-2] == 3)
         E_ij_prime = torch.einsum("iab,ijb->ija",alpha,E_ij_raw)
     else:
         E_ij_prime = alpha[:,None,None] * E_ij_raw
