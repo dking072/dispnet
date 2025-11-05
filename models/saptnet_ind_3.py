@@ -46,7 +46,8 @@ def prep_batch(batch,og_ptr,typ="A"):
     return batch
 
 class SaptNet(L.LightningModule):
-    def __init__(self,representation,qnet=None,ewald_sigma=1.0,freeze=True,anisotropy=False,a_bias=12.56):
+    def __init__(self,representation,qnet=None,ewald_sigma=1.0,freeze=True,freeze_charge=True,
+                 anisotropy=False,a_bias=12.56):
         super().__init__()
         cutoff = representation.r_max.item()
         zs = representation.atomic_numbers
@@ -65,7 +66,7 @@ class SaptNet(L.LightningModule):
             self.qnet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
         else:
             self.qnet = qnet
-            self.qnet.requires_grad_(False)
+            self.qnet.requires_grad_(freeze_charge)
 
         #Summed outer products for polarizabilities
         if self.anisotropy:
@@ -84,10 +85,24 @@ class SaptNet(L.LightningModule):
             irreps_out = o3.Irreps(f"1x0e")
             self.anet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
 
-    def calc_pol(self,r,q,a):
-        e_es, e_pol = calc_elec(r,q,a)
-        return {"e_es":e_es,"e_pol":e_pol}
-
+    def calc_lr(self,q,a,positions,batch,monA=None):
+        ees_lst, epol_lst = [], []
+        unique_batches = torch.unique(batch)
+        for i in unique_batches:
+            mask = batch == i  # Create a mask for the i-th configuration
+            r_now, q_now, a_now = positions[mask], q[mask], a[mask]
+            monA_now = monA[mask] if (monA is not None) else None
+    
+            #Calc pol data
+            e_es, e_pol = calc_elec(r_now,q_now,a_now,monA=monA_now,calc_pot=False)
+            ees_lst.append(e_es)
+            epol_lst.append(e_pol)
+    
+        ees_lst = torch.hstack(ees_lst)
+        epol_lst = torch.stack(epol_lst)
+    
+        return ees_lst, epol_lst
+    
     def get_qa(self,node_feats,sqrt3 = 1.7320508):
         q = self.qnet(node_feats).squeeze()
         if self.anisotropy:
@@ -99,85 +114,29 @@ class SaptNet(L.LightningModule):
         else:
             a = F.relu(self.anet(node_feats) + self.a_bias).squeeze()
         return q,a
-        
-    def calc_lr(self,data,out):
-        #Calc both ES and pol
-        q,a = self.get_qa(out["node_feats"])
 
-        e_es, epols = [], []
-        unique_batches = torch.unique(data["batch"])
-        for i in unique_batches:
-            mask = data["batch"] == i  # Create a mask for the i-th configuration
-            r_now, q_now, a_now = data["positions"][mask], q[mask], a[mask]
-
-            #Calc pol data
-            out = self.calc_pol(r_now,q_now,a_now)
-            epols.append(out["e_pol"])
-            e_es.append(out["e_es"])
-
-        e_es = torch.hstack(e_es)
-        e_ind = torch.stack(epols)
-
-        return e_es, e_ind
-
-    def calc_qa(self,data,out,calc_pol=True):
-        q,a = self.get_qa(out["node_feats"])
-        out = self.calc_pol(data["positions"],q,a)
-        out["q"] = q
-        out["a"] = a
-        out["z"] = (data["node_attrs"] @ self.representation.atomic_numbers.float()).int()
-        return out
-    
-    def pred_qa(self,data):
+    def forward(self,data,training=False,use_mace_charges=False):
         og_ptr = data["ptr"]
-        qlst, alst = [], []
-        
-        #Calc for dimer:
-        dimer_out = self.representation.forward(data,compute_force=False)
-        dimer_lr = self.calc_qa(data,dimer_out)
+        dimer_pos = data["positions"]
+        dimer_batch = data["batch"]
 
-        #monA
-        data = prep_batch(data,og_ptr,typ="A")
-        monA_out = self.representation.forward(data,compute_force=False)
-        monA_lr = self.calc_qa(data,monA_out)
-
-        #Calc for monB:
-        data = prep_batch(data,og_ptr,typ="B")
-        monB_out = self.representation.forward(data,compute_force=False)
-        monB_lr = self.calc_qa(data,monB_out)
+        rep = self.representation.forward(data,compute_force=False)
+        q,a = self.get_qa(rep["node_feats"])
+        if use_mace_charges:
+            q = rep["latent_charges"]
         
-        return dimer_lr, monA_lr, monB_lr
+        monAtot = []
+        for i_A, i_B in zip(data["numA"],data["numB"]):
+            idxA = torch.ones(i_A,device=q.device)
+            idxB = torch.zeros(i_B,device=q.device)
+            monA = torch.hstack([idxA,idxB])
+            monAtot.append(monA)
+        monAtot = torch.hstack(monAtot).bool()
 
-    def forward(self,data,training=False):
-        og_ptr = data["ptr"]
-        
-        #Calc for dimer:
-        lr_energies = {"es":[],"ind":[]}
-        dimer_out = self.representation.forward(data,compute_force=False)
-        e_es, e_ind = self.calc_lr(data,dimer_out)
-        lr_energies["es"].append(e_es)
-        lr_energies["ind"].append(e_ind)
-        
-        #Calc for monA:
-        data = prep_batch(data,og_ptr,typ="A")
-        monA_out = self.representation.forward(data,compute_force=False)
-        e_es, e_ind = self.calc_lr(data,monA_out)
-        lr_energies["es"].append(e_es)
-        lr_energies["ind"].append(e_ind)
-        
-        #Calc for monB:
-        data = prep_batch(data,og_ptr,typ="B")
-        monB_out = self.representation.forward(data,compute_force=False)
-        e_es, e_ind = self.calc_lr(data,monB_out)
-        lr_energies["es"].append(e_es)
-        lr_energies["ind"].append(e_ind)
-        # print(lr_energies["ind"])
-
-        #Calc ediff:
-        for k in ["es","ind"]:
-            data[f"pred_{k}"] = lr_energies[k][0] - (lr_energies[k][1] + lr_energies[k][2])
-        for k in ["energy","les_energy"]:
-            data[k] = dimer_out[k] - (monA_out[k] + monB_out[k])
-
+        e_es, e_ind = self.calc_lr(q,a,dimer_pos,dimer_batch,monA=monAtot)
+        data["pred_es"] = e_es
+        data["pred_ind"] = e_ind
+        data["pred_q"] = q
+        data["pred_a"] = a
         return data
         

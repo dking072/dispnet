@@ -53,9 +53,8 @@ def calc_elec(r_raw,q,alpha,monA=None,sigma=1,calc_pot=True):
     twopi =  2.0 * torch.pi
     c = 1/(sigma * (2.0 ** 0.5))
     erf_term = torch.special.erf(c*r_ij_norm)
-    r_p_ij = 1/r_ij_norm
 
-    #Mask r_p_ij for masked ES
+    r_p_ij = 1/r_ij_norm
     if monA is not None:
         monA_idx = torch.where(monA)[0]
         monB_idx = torch.where(~monA)[0]
@@ -67,23 +66,17 @@ def calc_elec(r_raw,q,alpha,monA=None,sigma=1,calc_pot=True):
         torch.diagonal(q_pot).zero_()
         q_pot = q_pot.sum(axis=0)
         e_es = (q*q_pot).sum() * 90.0474 #Normalization
+    else:
+        e_es = torch.zeros(1,device=r_raw.device)
         
     # Derivative of φ(r) = erf(arg)/r, [N,N]
     exp_term = torch.exp(-(c*r_ij_norm)**2) # [n, n]
-    dphi_dr = c * (2.0 / (torch.pi ** 0.5)) * exp_term / r_ij_norm - erf_term / (r_ij_norm ** 2)
+    dphi_dr = c * (2.0 / (torch.pi ** 0.5)) * exp_term * r_p_ij - erf_term * r_p_ij**2
     dphi_dr = 1/twopi * dphi_dr * 1/2
-    torch.diagonal(dphi_dr).zero_()
-
-    #Mask r_ij by monomer
-    if monA is not None:
-        monA_idx = torch.where(monA)[0]
-        monB_idx = torch.where(~monA)[0]
-        r_ij[monA_idx[:,None],monA_idx] = 0
-        r_ij[monB_idx[:,None],monB_idx] = 0
     
     # Field at i caused by j
-    # [1,N,1] , [N,N,1] x [N,N,3] --> [N,N,3]
-    E_ij_raw = q[None,:,None] * dphi_dr[:,:,None] * (r_ij / r_ij_norm[:,:,None])
+    # [1,N,1] , [N,N,1] x [N,N,3] x [N,N,1] --> [N,N,3]
+    E_ij_raw = q[None,:,None] * dphi_dr[:,:,None] * r_ij * r_p_ij[:,:,None]
     E_ij = E_ij_raw.sum(axis=1) #[N,3]
     
     #Calc E^T a E
