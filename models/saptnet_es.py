@@ -13,7 +13,8 @@ from mace.modules.irreps_tools import tp_out_irreps_with_instructions
 from dispnet.mace.blocks import NonLinearDipolePolarReadoutBlock
 from e3nn.io import CartesianTensor
 
-from dispnet.util.pol import calc_elec
+# from dispnet.util.pol import calc_elec
+from dispnet.util.pol import LRElec
 
 def make_batch(numA):
     arr = []
@@ -46,14 +47,15 @@ def prep_batch(batch,og_ptr,typ="A"):
     return batch
 
 class SaptNet(L.LightningModule):
-    def __init__(self,representation,qnet=None,ewald_sigma=1.0,freeze=True,freeze_charge=True,
-                 anisotropy=False,a_bias=12.56):
+    def __init__(self,representation,qnet=None,sigma=1.0,freeze=True,anisotropy=False,a_bias=12.56,calc_qa=False):
         super().__init__()
-        cutoff = representation.r_max.item()
-        zs = representation.atomic_numbers
+        self.cutoff = representation.r_max.item()
+        self.zs = representation.atomic_numbers
         self.representation = representation
         self.anisotropy = anisotropy
         self.register_buffer('a_bias', torch.tensor([a_bias]).float())
+        self.register_buffer('sigma', torch.tensor([sigma]).float())
+        self.calc_qa = calc_qa
         if freeze:
             self.representation.requires_grad_(False)
 
@@ -66,8 +68,8 @@ class SaptNet(L.LightningModule):
             self.qnet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
         else:
             self.qnet = qnet
-            if freeze_charge:
-                self.qnet.requires_grad_(True)
+            #Don't freeze
+            self.qnet.requires_grad_(True)
 
         #Summed outer products for polarizabilities
         if self.anisotropy:
@@ -86,26 +88,33 @@ class SaptNet(L.LightningModule):
             irreps_out = o3.Irreps(f"1x0e")
             self.anet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
 
-    def calc_lr(self,q,a,positions,batch,monA=None):
-        ees_lst, epol_lst = [], []
+    def calc_lr(self,q,positions,batch,a=None,monA=None):
+        ees_lst = []
+        if a is not None:
+            epol_lst = []
+            
         unique_batches = torch.unique(batch)
         for i in unique_batches:
             mask = batch == i  # Create a mask for the i-th configuration
-            r_now, q_now, a_now = positions[mask], q[mask], a[mask]
+            r_now, q_now = positions[mask], q[mask]
             monA_now = monA[mask] if (monA is not None) else None
-    
-            #Calc pol data
-            e_es, e_pol = calc_elec(r_now,q_now,a_now,monA=monA_now)
+            
+            obj = LRElec(r_now,monA_now,sigma=self.sigma)
+            e_es = obj.calc_qq(q_now)
             ees_lst.append(e_es)
-            epol_lst.append(e_pol)
+            if a is not None:
+                a_now = a[mask]
+                e_pol = obj.calc_qa(q_now,a_now)
+                epol_lst.append(e_pol)
     
         ees_lst = torch.hstack(ees_lst)
-        epol_lst = torch.stack(epol_lst)
+        out = {"e_es":ees_lst}
+        if a is not None:
+            out["e_pol"] = torch.stack(epol_lst)
     
-        return ees_lst, epol_lst
+        return out
     
-    def get_qa(self,node_feats,sqrt3 = 1.7320508):
-        q = self.qnet(node_feats).squeeze()
+    def get_a(self,node_feats,sqrt3 = 1.7320508):
         if self.anisotropy:
             #bias trace
             tp_out = self.tp(node_feats,node_feats)
@@ -114,30 +123,35 @@ class SaptNet(L.LightningModule):
             a = self.ct.to_cartesian(dnet_out)
         else:
             a = F.relu(self.anet(node_feats) + self.a_bias).squeeze()
-        return q,a
+        return a
 
     def forward(self,data,training=False,use_mace_charges=False):
-        og_ptr = data["ptr"]
-        dimer_pos = data["positions"]
-        dimer_batch = data["batch"]
-
         rep = self.representation.forward(data,compute_force=False)
-        q,a = self.get_qa(rep["node_feats"])
-        if use_mace_charges:
+        
+        if not use_mace_charges:
+            q = self.qnet(rep["node_feats"]).squeeze()
+        else:
             q = rep["latent_charges"]
+            
+        if self.calc_qa:
+            a = self.get_a(rep["node_feats"])
+        else:
+            a = None
         
         monAtot = []
-        for i_A, i_B in zip(data["numA"],data["numB"]):
+        for i_A, i_B in zip(data["numA"].int(),data["numB"].int()):
             idxA = torch.ones(i_A,device=q.device)
             idxB = torch.zeros(i_B,device=q.device)
             monA = torch.hstack([idxA,idxB])
             monAtot.append(monA)
         monAtot = torch.hstack(monAtot).bool()
 
-        e_es, e_ind = self.calc_lr(q,a,dimer_pos,dimer_batch,monA=monAtot)
-        data["pred_es"] = e_es
-        data["pred_ind"] = e_ind
+        # e_es, e_ind = self.calc_lr(q,a,dimer_pos,dimer_batch,monA=monAtot)
+        e_lrs = self.calc_lr(q,data["positions"],data["batch"],a=a,monA=monAtot)
+        data["pred_es"] = e_lrs["e_es"]
         data["pred_q"] = q
-        data["pred_a"] = a
+        if self.calc_qa:
+            data["pred_ind"] = e_lrs["e_pol"]
+            data["pred_a"] = a
         return data
         
