@@ -46,9 +46,11 @@ def calc_pol(q,r,cell,batch,remove_mean=True,epsilon_factor=1):
             phase = torch.ones_like(r_now, dtype=torch.complex64)
         else:
             polarization, phase = compute_pol_pbc(r_now, q_now, box_now)
+            print(polarization.shape)
 
         all_P.append(polarization * normalization_factor)
         all_phases.append(phase)
     P = torch.stack(all_P, dim=0)
-    return P
-
+    phases = torch.cat(all_phases, dim=0)
+    result = P * phases.conj()
+    return result.real
