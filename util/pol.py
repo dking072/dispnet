@@ -92,6 +92,15 @@ class LRElec:
         epol = -0.5 * (E_ij * E_ij_prime).sum() * 90.0474
         return epol
 
+    def calc_efield(self,q):
+        exp_term = torch.exp(-(self.c*self.r_ij_norm)**2) # [n, n]
+        dphi_dr = self.c * (2.0 / (torch.pi ** 0.5)) * exp_term * self.r_p_ij - self.erf_term * self.r_p_ij**2
+        dphi_dr = 1/self.twopi * dphi_dr * 1/2
+
+        E_ij_raw = q[None,:,None] * dphi_dr[:,:,None] * self.r_ij * self.r_p_ij[:,:,None]
+        E_ij = E_ij_raw.sum(axis=1) #[N,3]
+        return E_ij
+        
 def calc_elec(r_raw,q,alpha,monA=None,sigma=1,calc_pot=True):
     #Simplified polarization
     epsilon = 1e-6
