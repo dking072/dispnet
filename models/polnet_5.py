@@ -59,18 +59,15 @@ class LRElec:
 
     def calc_qa(self,q,a,damping_denom=None):
         if damping_denom is not None:
-            dphi_dr = 1/self.twopi * 1/(self.r_ij_norm**2 + damping_denom**2)
+            #E^2 -- should be positive
+            dphi_dr = 1/self.twopi * 1/(self.r_ij_norm**4 + damping_denom**4)
         else:
-            dphi_dr = 1/self.twopi * self.r_p_ij**2
+            dphi_dr = 1/self.twopi * self.r_p_ij**4
 
-        # if self.damping is not None:
-        #     dphi_dr = dphi_dr * self.damping
+        if self.damping is not None:
+            dphi_dr = dphi_dr * self.damping
 
-        emag = (q[None,:] * dphi_dr).sum(axis=1)
-        epol = -0.5 * (emag**2 * a).sum() * 90.0474
-        # epol = (-0.5 * emag * a).sum() * 90.0474
-        # One is qa/r^4, one is q^2a/r^4
-        # So yeah, weird nonlinear tradeoff between q and a
+        epol = -0.5 * (q[None,:]**2 * dphi_dr * a[:,None]).sum() * 90.0474
         return epol
 
         # rhat = self.r_ij * self.r_p_ij[:,:,None]
