@@ -13,52 +13,62 @@ from mace.modules.irreps_tools import tp_out_irreps_with_instructions
 from dispnet.mace.blocks import NonLinearDipolePolarReadoutBlock
 from e3nn.io import CartesianTensor
 import numpy as np
+from cace.modules.cutoff import SwitchFunction
+
+def min_distance(cell,positions):
+    inv = torch.linalg.inv(cell)
+    rij = positions[:,None] - positions[None,:]
+    s = torch.einsum("ab,ijb->ija",inv,rij)
+    s = s - torch.round(s)
+    s = torch.einsum("ab,ijb->ija",cell,s)
+    return s #[N,N,3]
 
 class LRElec:
-    def __init__(self,r_raw,monA=None,sigma=1,cutoff_fn=None):
-        epsilon = 1e-6
-        r_ij = r_raw.unsqueeze(0) - r_raw.unsqueeze(1)  # [n, n, 3]
-        torch.diagonal(r_ij).add_(epsilon)
-        r_ij_norm = torch.norm(r_ij, dim=-1)
-        self.r_ij = r_ij
-        self.r_ij_norm = r_ij_norm
-        self.sigma = sigma
-        if cutoff_fn is not None:
-            self.damping = cutoff_fn(r_ij_norm)
-        else:
-            self.damping = None
-        
-        r_p_ij = 1/r_ij_norm
-        if monA is not None:
-            monA_idx = torch.where(monA)[0]
-            monB_idx = torch.where(~monA)[0]
-            r_p_ij[monA_idx[:,None],monA_idx] = 0
-            r_p_ij[monB_idx[:,None],monB_idx] = 0
-        else:
-            ind = np.diag_indices(r_p_ij.shape[0])
-            r_p_ij[ind[0],ind[1]] = torch.zeros(r_p_ij.shape[0],device=r_p_ij.device)
-        self.r_p_ij = r_p_ij
-
+    def __init__(self,r_raw,cell,monA=None,sigma=1):
+        self.cell = cell
         self.twopi =  2.0 * torch.pi
-        self.c = 1/(self.sigma * (2.0 ** 0.5))
-        self.erf_term = torch.special.erf(self.c*self.r_ij_norm)
+        if cell is None:
+            self.periodic = False
+        else:
+            self.periodic = torch.linalg.det(cell).any()
 
-    def calc_qq(self,q):
-        q_pot = 1/self.twopi * q[:,None] * self.r_p_ij * self.erf_term * 1/2
-        q_pot = q_pot.sum(axis=0)
-        e_es = (q*q_pot).sum() * 90.0474 #Normalization
-        return e_es
-
-    def calc_qa(self,q,a,damping_denom=None):
-        # damping_denom = None
-        # if damping_denom is not None:
-        #     dphi_dr = 1/self.twopi * 1/(self.r_ij_norm**2 + damping_denom**2)
-        # else:
-        #     dphi_dr = 1/self.twopi * self.r_p_ij**2
-
-        # epol = 1/self.twopi * -0.5 * (q[None,:]**2 * self.r_p_ij**4 * a[:,None]).sum() * 90.0474
-        # print("epol1:",epol)
+        if not self.periodic:
+            epsilon = 1e-6
+            r_ij = r_raw.unsqueeze(0) - r_raw.unsqueeze(1)  # [n, n, 3]
+            torch.diagonal(r_ij).add_(epsilon)
+            r_ij_norm = torch.norm(r_ij, dim=-1)
+            self.r_ij = r_ij
+            self.r_ij_norm = r_ij_norm
+            r_p_ij = 1/r_ij_norm
+            if monA is not None:
+                monA_idx = torch.where(monA)[0]
+                monB_idx = torch.where(~monA)[0]
+                r_p_ij[monA_idx[:,None],monA_idx] = 0
+                r_p_ij[monB_idx[:,None],monB_idx] = 0
+            else:
+                ind = np.diag_indices(r_p_ij.shape[0])
+                r_p_ij[ind[0],ind[1]] = torch.zeros(r_p_ij.shape[0],device=r_p_ij.device)
+            self.r_p_ij = r_p_ij
+        else:
+            self.r_ij = min_distance(cell,r_raw)
+            
         
+    # self.c = 1/(self.sigma * (2.0 ** 0.5))
+        # self.erf_term = torch.special.erf(self.c*self.r_ij_norm)
+
+    # def calc_qq(self,q):
+    #     q_pot = 1/self.twopi * q[:,None] * self.r_p_ij * self.erf_term * 1/2
+    #     q_pot = q_pot.sum(axis=0)
+    #     e_es = (q*q_pot).sum() * 90.0474 #Normalization
+    #     return e_es
+
+    def calc_qa(self,q,a):
+        if not self.periodic:
+            return self.calc_qa_real(q,a)
+        else:
+            return self.calc_qa_periodic(q,a)
+
+    def calc_qa_real(self,q,a):
         if len(a.shape) == 1:
             emag = (q[None,:] * self.r_p_ij**2).pow(2)
             epol = -0.5 * 1/self.twopi * (a[:,None] * emag).sum() * 90.0474
@@ -70,22 +80,41 @@ class LRElec:
             eij = (q[None,:] * self.r_p_ij**2)[:,:,None] * rhat
             eij_prime = torch.einsum("iab,ijb->ija",a,eij)
             epol = -0.5 * (eij * eij_prime).sum() * 90.0474
-            
+        return epol
 
-        # if len(a.shape) == 1:
-        #     emag = (q[None,:] * dphi_dr).pow(2)
-        #     epol = -0.5 * (a[:,None] * emag).sum()
-        #     # emag = (q[None,:] * dphi_dr).sum(axis=1) #[N,N] sum!
-        #     # epol = -0.5 * (emag**2 * a).sum() * 90.0474
-        # else:
-        #     assert(len(a.shape) == 3) #[N,3,3]
-        #     assert(a.shape[-1] == 3)
-        #     assert(a.shape[-2] == 3)
-        #     rhat = self.r_ij * self.r_p_ij[:,:,None] #[N,N,3]
-        #     eij = q[None,:,None] * dphi_dr[:,:,None] * rhat #[N,N,3]
-        #     eij_prime = torch.einsum("iab,ijb->ija",a,eij)
-        #     epol = -0.5 * (eij * eij_prime).sum() * 90.0474
-            
+    def calc_qa_periodic(self,q,a,cutoff=20):
+        cutoff_fn = SwitchFunction(cutoff-3,cutoff)
+        s = self.r_ij
+        epol = 0
+    
+        #Compute min distance interaction
+        rij = torch.linalg.norm(s,dim=-1)
+        aq2 = a[None,:] * q[:,None]**2
+        mask = ~torch.eye(rij.shape[0],dtype=torch.bool,device=a.device)
+        epol = epol + (aq2[mask] * 1/(rij[mask]**4) * cutoff_fn(rij[mask])).sum()
+    
+        trans_vecs = []
+        nvec = 5
+        for i in range(0,nvec):
+            for j in range(0,nvec):
+                for k in range(0,nvec):
+                    if i == j == k == 0:
+                        continue
+                    d = self.cell[:,0]*i + self.cell[:,1]*j + self.cell[:,2]*k
+                    trans_vecs.append(d)
+        trans_vecs = torch.vstack(trans_vecs)
+        trans_ds = torch.linalg.norm(trans_vecs,dim=-1)
+    
+        lim = 0.5*torch.linalg.norm(self.cell.sum(axis=1)) + cutoff
+        mask = trans_ds < lim
+        assert(not mask.all()) #increase nvec if hit
+        # print(len(trans_vecs[mask]))
+        for d in trans_vecs[mask]:
+            s_prime = s + d[None,None,:]
+            rij = torch.linalg.norm(s_prime,dim=-1)
+            epolp = (aq2 * 1/(rij**4) * cutoff_fn(rij)).sum()
+            epol = epol + epolp
+        epol = -0.5 * 1/self.twopi * epol * 90.0474
         return epol
 
 class PolNet(L.LightningModule):
@@ -127,60 +156,20 @@ class PolNet(L.LightningModule):
             irreps_out = o3.Irreps(f"1x0e")
             self.anet = NonLinearReadoutBlock(irreps_in,mlp_irreps,gate,irreps_out)
 
-    def calc_energy(self,atomic_e,q,positions,batch,a=None,monA=None):
-        ees_lst = []
-        atomic_lst = []
-        efield_lst = []
-        if a is not None:
-            epol_lst = []
-            
-        unique_batches = torch.unique(batch)
-        for i in unique_batches:
-            mask = batch == i  # Create a mask for the i-th configuration
-            atomic_e_now = atomic_e[mask]
-            r_now, q_now = positions[mask], q[mask]
-            monA_now = monA[mask] if (monA is not None) else None
-            
-            obj = LRElec(r_now,monA_now,sigma=self.sigma,
-                         cutoff_fn=inv_cutoff)
-            e_es = obj.calc_qq(q_now)
-            ees_lst.append(e_es)
-            atomic_lst.append(atomic_e_now.sum())
-            efield = obj.calc_efield(q_now)
-            efield_lst.append(efield)
-            if a is not None:
-                a_now = a[mask]
-                e_pol = obj.calc_qa(q_now,a_now)
-                epol_lst.append(e_pol)
-    
-        ees_lst = torch.hstack(ees_lst)
-        atomic_lst = torch.hstack(atomic_lst)
-        efield_lst = torch.vstack(efield_lst)
-        out = {"e_es":ees_lst,"e_atomic":atomic_lst,"efield":efield_lst}
-        if a is not None:
-            out["e_pol"] = torch.stack(epol_lst)
-    
-        return out
-
-    def calc_ind(self,q,positions,batch,a,monA=None):
-        # ees_lst = []
-        # atomic_lst = []
-        # efield_lst = []
+    def calc_ind(self,q,positions,batch,a,cell,monA=None):
         epol_lst = []
-        # if a is not None:
-        #     epol_lst = []
-            
+
         unique_batches = torch.unique(batch)
+        cell = cell.reshape(len(unique_batches),3,3)
         for i in unique_batches:
             mask = batch == i  # Create a mask for the i-th configuration
-            # atomic_e_now = atomic_e[mask]
             r_now, q_now = positions[mask], q[mask]
+            cell_now = cell[i]
             monA_now = monA[mask] if (monA is not None) else None
             
-            # obj = LRElec(r_now,monA_now,sigma=self.sigma,cutoff_fn=inv_cutoff)
-            obj = LRElec(r_now,monA_now,sigma=self.sigma)
+            obj = LRElec(r_now,cell_now,monA_now,sigma=self.sigma)
             a_now = a[mask]
-            e_pol = obj.calc_qa(q_now,a_now,damping_denom=self.damping_factor)
+            e_pol = obj.calc_qa(q_now,a_now)
             epol_lst.append(e_pol)
 
         return torch.hstack(epol_lst)
@@ -203,7 +192,7 @@ class PolNet(L.LightningModule):
         rep = self.representation.forward(data,compute_force=False)
         a = self.get_a(rep["node_feats"])
         q = rep["latent_charges"]
-        data["pred_ind"] = self.calc_ind(q,data["positions"],data["batch"],a,monA=None)
+        data["pred_ind"] = self.calc_ind(q,data["positions"],data["batch"],a,data["cell"],monA=None)
         data["pred_energy"] = rep["energy"] + data["pred_ind"]
         data["pred_a"] = a
         data["pred_q"] = q
